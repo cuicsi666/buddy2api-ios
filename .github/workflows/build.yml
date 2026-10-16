@@ -58,7 +58,7 @@ jobs:
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             ONLY_ACTIVE_ARCH=NO \
-            build | tail -60
+            -quiet build 2>&1 | tail -120
           APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
           echo "APP=$APP" >> "$GITHUB_ENV"
           ls -la "$APP"

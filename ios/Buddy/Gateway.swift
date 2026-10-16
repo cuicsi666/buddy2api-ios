@@ -46,7 +46,8 @@ final class Gateway: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             let ret = dir.withCString { cDir in
                 listen.withCString { cListen in
-                    BuddyStart(cDir, cListen)
+                    BuddyStart(UnsafeMutablePointer(mutating: cDir),
+                               UnsafeMutablePointer(mutating: cListen))
                 }
             }
             var err: String?
