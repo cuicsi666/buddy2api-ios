@@ -11,6 +11,7 @@ final class Gateway: ObservableObject {
     @Published private(set) var running = false
     @Published private(set) var addr = ""
     @Published private(set) var busy = false
+    @Published private(set) var keepAliveOn = false
     @Published var alert: String?
 
     /// 数据目录：Documents/Buddy2API（可在「文件」App 里直接查看、导入凭证）
@@ -61,6 +62,9 @@ final class Gateway: ObservableObject {
                     self.alert = e
                 }
                 self.syncState()
+                if self.running {
+                    self.applyKeepAlive(UserDefaults.standard.object(forKey: "keepAlive") as? Bool ?? true)
+                }
             }
         }
     }
@@ -78,8 +82,20 @@ final class Gateway: ObservableObject {
             DispatchQueue.main.async {
                 self.busy = false
                 if let e = err, !e.isEmpty { self.alert = e }
+                KeepAlive.shared.stop()
+                self.keepAliveOn = false
                 self.syncState()
             }
+        }
+    }
+
+    /// 开关后台保活（静音音频播放，防系统挂起）
+    func applyKeepAlive(_ wanted: Bool) {
+        if wanted && running {
+            keepAliveOn = KeepAlive.shared.start()
+        } else {
+            KeepAlive.shared.stop()
+            keepAliveOn = false
         }
     }
 

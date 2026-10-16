@@ -35,7 +35,7 @@ jobs:
           export CGO_CFLAGS="-isysroot $SDK -miphoneos-version-min=15.0 -arch arm64 -fembed-bitcode=off"
           export CGO_LDFLAGS="-isysroot $SDK -miphoneos-version-min=15.0 -arch arm64"
           go build -tags carchive -buildmode=c-archive \
-            -ldflags "-s -w -X buddy2api-go/internal/proxy.Version=v1.0-ios" \
+            -ldflags "-s -w -X buddy2api-go/internal/proxy.Version=v2.0-ios" \
             -o ../ios/GoLib/libbuddy.a ./iosmain
           ls -la ../ios/GoLib/
 

@@ -4,6 +4,7 @@ struct ContentView: View {
     @ObservedObject private var gw = Gateway.shared
     @State private var showPanel = false
     @AppStorage("autoStart") private var autoStart = true
+    @AppStorage("keepAlive") private var keepAlive = true
 
     private var alertBinding: Binding<Bool> {
         Binding(get: { gw.alert != nil }, set: { if !$0 { gw.alert = nil } })
@@ -56,6 +57,11 @@ struct ContentView: View {
                     Text(gw.running ? "http://\(gw.addr)" : "点下方按钮启动")
                         .font(.caption)
                         .foregroundColor(.secondary)
+                    if gw.running {
+                        Text(gw.keepAliveOn ? "后台保活已开启" : "后台保活未开启")
+                            .font(.caption2)
+                            .foregroundColor(gw.keepAliveOn ? .green : .orange)
+                    }
                 }
                 Spacer()
                 if gw.busy { ProgressView() }
@@ -77,6 +83,11 @@ struct ContentView: View {
             .disabled(gw.busy)
 
             Toggle("打开 App 时自动启动", isOn: $autoStart)
+
+            Toggle("后台保活（静音音频）", isOn: $keepAlive)
+                .onChange(of: keepAlive) { on in
+                    gw.applyKeepAlive(on)
+                }
         }
     }
 
@@ -101,6 +112,7 @@ struct ContentView: View {
             infoRow("内核版本", gw.version)
             infoRow("监听地址", gw.running ? gw.addr : "—")
             infoRow("运行时长", gw.running ? gw.uptimeText : "—")
+            infoRow("后台保活", gw.keepAliveOn ? "已开启（静音音频）" : "未开启")
         }
     }
 
