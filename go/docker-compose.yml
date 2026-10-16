@@ -1,0 +1,16 @@
+services:
+  buddy2api:
+    build: .
+    ports:
+      - "0.0.0.0:10082:10082"   # 全网卡监听，局域网可访问；仅本机使用可改回 127.0.0.1:10082:10082
+    volumes:
+      - ./data:/app/data
+    environment:
+      BUDDY2API_LISTEN: 0.0.0.0:10082
+      # BUDDY2API_REGION: cn            # cn（默认，copilot.tencent.com）/ global（www.codebuddy.ai）
+      # BUDDY2API_ADMIN_PASSWORD: password    # 明文密码，启动时哈希写回 config.json（优先级最高；不设则默认 password）
+      # BUDDY2API_AUTO_CHECKIN: "true"
+      # BUDDY2API_CHECKIN_CRON: "0 0 9 * * *"
+      # BUDDY2API_RESOURCE_CACHE_SECONDS: "300"
+      # BUDDY2API_LOG_RETENTION_DAYS: "90"
+    restart: unless-stopped

@@ -1,0 +1,6 @@
+ios/GoLib/
+ios/build/
+ios/Buddy2API.xcodeproj/
+*.ipa
+*.xcuserdatad/
+.DS_Store

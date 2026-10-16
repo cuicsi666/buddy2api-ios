@@ -1,0 +1,1110 @@
+package admin
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"math"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+
+	"buddy2api-go/internal/apikey"
+	"buddy2api-go/internal/auth"
+	"buddy2api-go/internal/config"
+	"buddy2api-go/internal/scheduler"
+	"buddy2api-go/internal/store"
+	"buddy2api-go/internal/upstream"
+)
+
+// SchedulerControl 由 scheduler 实现：设置变更后重装配定时任务 + 成长任务链手动触发。
+type SchedulerControl interface {
+	Reconfigure()
+	// ResetAccountState 换账号后复位日内状态（内存 + 成长日标志/last_run 镜像）。
+	// 这些状态按日分片而非按账号，不清的话新账号会继承旧账号的「今日已完成」而当天静默跳过；
+	// 镜像必须在 scheduler 内持锁删（原因见 scheduler.ResetAccountState 注释）。
+	ResetAccountState()
+	RunGrowthChain() scheduler.GrowthChainResult
+	RunTravelTick() scheduler.TravelTickResult
+	RunActivityReports(count int) scheduler.ActivityReportResult
+	RunGrowthAdopt() scheduler.GrowthAdoptResult
+	RunGrowthRedeem(tier string) scheduler.GrowthRedeemActionResult
+}
+
+// Handler 管理后台 API 处理器。
+type Handler struct {
+	cfg     *config.Manager
+	st      *store.Store
+	toks    *auth.TokenStore
+	client  *upstream.Client
+	growth  growthAPI // 成长端点依赖（生产为 client 本体；测试可注入 fake）
+	models  *upstream.ModelCache
+	keys    *apikey.Manager
+	sched   SchedulerControl
+	session *Session
+}
+
+// New 创建处理器。
+func New(cfg *config.Manager, st *store.Store, toks *auth.TokenStore, client *upstream.Client,
+	models *upstream.ModelCache, keys *apikey.Manager, sched SchedulerControl, session *Session) *Handler {
+	return &Handler{cfg: cfg, st: st, toks: toks, client: client, growth: client, models: models, keys: keys, sched: sched, session: session}
+}
+
+// Routes 挂载 /admin 路由。
+func (h *Handler) Routes() func(chi.Router) {
+	return func(r chi.Router) {
+		r.Post("/login", h.login)
+		r.Post("/logout", h.logout)
+		r.Get("/session", h.sessionCheck)
+
+		r.Group(func(r chi.Router) {
+			r.Use(h.requireSession)
+			r.Get("/account", h.account)
+			r.Post("/account/oauth/start", h.oauthStart)
+			r.Get("/account/oauth/poll", h.oauthPoll)
+			r.Post("/account/refresh", h.accountRefresh)
+			r.Post("/account/test", h.accountTest)
+			r.Delete("/account", h.accountDelete)
+			r.Get("/account/export", h.accountExport)
+			r.Post("/account/import", h.accountImport)
+
+			r.Get("/resources", h.resources)
+			r.Get("/checkin/status", h.checkinStatus)
+			r.Post("/checkin/claim", h.checkinClaim)
+
+			r.Get("/growth/overview", h.growthOverview)
+			r.Post("/growth/run", h.growthRun)
+			r.Post("/growth/report", h.growthReport)
+			r.Post("/growth/adopt", h.growthAdopt)
+			r.Post("/growth/travel", h.growthTravel)
+			r.Post("/growth/redeem", h.growthRedeem)
+			r.Post("/growth/lottery", h.growthLottery)
+			r.Post("/growth/makeup", h.growthMakeup)
+			r.Post("/growth/bonus", h.growthBonus)
+
+			r.Get("/api-keys", h.listKeys)
+			r.Post("/api-keys", h.createKey)
+			r.Put("/api-keys/{id}", h.updateKey)
+			r.Delete("/api-keys/{id}", h.deleteKey)
+
+			r.Get("/logs", h.logs)
+			r.Get("/stats", h.stats)
+
+			r.Get("/settings", h.getSettings)
+			r.Put("/settings", h.putSettings)
+			r.Get("/models", h.listModels)
+			r.Post("/models/refresh", h.refreshModels)
+		})
+	}
+}
+
+// ── util ──
+
+func jsonWrite(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func jsonErr(w http.ResponseWriter, status int, msg string) {
+	jsonWrite(w, status, map[string]any{"error": msg})
+}
+
+func readJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		jsonErr(w, http.StatusBadRequest, "读取请求体失败")
+		return false
+	}
+	if len(raw) == 0 {
+		return true // 空体
+	}
+	if err := json.Unmarshal(raw, dst); err != nil {
+		jsonErr(w, http.StatusBadRequest, "请求体不是合法 JSON: "+err.Error())
+		return false
+	}
+	return true
+}
+
+func (h *Handler) requireSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !h.session.Valid(r) {
+			jsonErr(w, http.StatusUnauthorized, "未登录或会话已过期")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ── 登录 ──
+
+func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Password string `json:"password"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	if req.Password == "" || !h.cfg.VerifyAdminPassword(req.Password) {
+		time.Sleep(500 * time.Millisecond) // 减缓爆破
+		jsonErr(w, http.StatusUnauthorized, "密码错误")
+		return
+	}
+	h.session.Issue(w, r)
+	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
+	h.session.Clear(w, r)
+	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (h *Handler) sessionCheck(w http.ResponseWriter, r *http.Request) {
+	jsonWrite(w, http.StatusOK, map[string]any{"logged_in": h.session.Valid(r)})
+}
+
+// ── 账号 ──
+
+// invalidateAccountCaches 凭证变更（导入 / 登出 / OAuth 登录）后清掉旧账号的缓存与日内状态。
+//
+// 缓存键都是固定字串（单账号设计），换账号后旧账号的余额/签到/成长会在 TTL 内继续命中，
+// 前端显示上一账号的数据；scheduler 的日内状态还会让新账号继承「今日已完成」而当天跳过定时任务。
+//
+// 只清 admin 自己服务的展示缓存；成长日标志与 last_run 归 scheduler.ResetAccountState()（须持锁删）。
+// checkin_cache/random_target 刻意保留：那是当日随机签到时刻，与账号无关，删了会在同一天重摇。
+//
+// 调用方须先确认真的换了账号（accountSwitched），否则同账号重导当天会重新签到、重报一轮。
+func (h *Handler) invalidateAccountCaches() {
+	// 清缓存失败不阻断换账号（凭证已落盘），但要留痕：静默失败会让新账号读到旧数据。
+	del := func(table, key string) {
+		if err := h.st.DeleteCacheKey(table, key); err != nil {
+			slog.Warn("换账号清理缓存失败", "table", table, "key", key, "error", err)
+		}
+	}
+	// 余额：当前键 + 历史残留键
+	for _, k := range append([]string{resourceCacheKey}, resourceCacheStaleKeys...) {
+		del("resource_cache", k)
+	}
+	// 签到状态（60s 展示缓存，决定前端「今日已签到」；random_target 保留）
+	del("checkin_cache", "status")
+	// 成长总览（60s 展示缓存；日标志 / last_run 见下）
+	del(growthCacheTable, growthKeyOverview)
+	// 内存日内状态 + 成长日标志/last_run 镜像
+	if h.sched != nil {
+		h.sched.ResetAccountState()
+		// 复位后重装配：ResetAccountState 已清掉 report_day，growthCatchupDue 才会判定
+		// 「今日未上报」并排 30s 后的补跑。顺序不可颠倒，否则补跑排不上。
+		h.sched.Reconfigure()
+	}
+}
+
+// accountSwitched 判定本次凭证写入是否真的换了账号。
+//
+// 补传过期 token.json、重扫同一账号是最常见的恢复路径，此时清日标志会让当天重新上报一轮
+// （上游按新会话计，活跃上报翻倍），所以只在账号真的变了时才失效。
+// 判不准（旧凭证缺失 / 任一侧 UID 为空）时按「换了」处理：宁可多失效一次，也别让新账号整天静默跳过。
+func accountSwitched(prev, next *auth.Token) bool {
+	if prev == nil || next == nil || prev.UID == "" || next.UID == "" {
+		return true
+	}
+	return prev.UID != next.UID
+}
+
+func maskToken(s string) string {
+	if len(s) <= 20 {
+		return s
+	}
+	return s[:16] + "..." + s[len(s)-6:]
+}
+
+func (h *Handler) account(w http.ResponseWriter, r *http.Request) {
+	cfg := h.cfg.Get()
+	ep := config.EndpointOf(cfg.Region)
+	t := h.toks.Get()
+	if t == nil {
+		jsonWrite(w, http.StatusOK, map[string]any{
+			"logged_in": false, "region": cfg.Region, "region_name": ep.Name,
+		})
+		return
+	}
+	jsonWrite(w, http.StatusOK, map[string]any{
+		"logged_in":     true,
+		"mode":          "oauth",
+		"access_token":  maskToken(t.AccessToken),
+		"has_refresh":   t.RefreshToken != "",
+		"uid":           t.UID,
+		"enterprise_id": t.EnterpriseID,
+		"nickname":      t.Nickname,
+		"domain":        t.Domain,
+		"expires_at":    t.ExpiresAt,
+		"expires_human": t.ExpiresInHuman(),
+		"expired":       t.IsExpired(),
+		"saved_at":      t.SavedAt,
+		"region":        cfg.Region,
+		"region_name":   ep.Name,
+		"region_match":  t.Domain == ep.Domain, // 凭证与当前端点是否匹配
+	})
+}
+
+func (h *Handler) oauthStart(w http.ResponseWriter, r *http.Request) {
+	state, authURL, err := h.client.OAuthStart()
+	if err != nil {
+		jsonErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	jsonWrite(w, http.StatusOK, map[string]any{
+		"state": state, "auth_url": authURL, "expires_in": 300,
+	})
+}
+
+func (h *Handler) oauthPoll(w http.ResponseWriter, r *http.Request) {
+	state := strings.TrimSpace(r.URL.Query().Get("state"))
+	if state == "" {
+		jsonErr(w, http.StatusBadRequest, "缺少 state 参数")
+		return
+	}
+	tok, ok, err := h.client.OAuthPoll(state)
+	if err != nil {
+		jsonWrite(w, http.StatusOK, map[string]any{"status": "error", "message": err.Error()})
+		return
+	}
+	if !ok {
+		jsonWrite(w, http.StatusOK, map[string]any{"status": "pending"})
+		return
+	}
+	prev := h.toks.Get()
+	if err := h.toks.Save(tok); err != nil {
+		jsonErr(w, http.StatusInternalServerError, "保存凭证失败: "+err.Error())
+		return
+	}
+	if accountSwitched(prev, tok) {
+		// 真的换了账号才清；同一账号重新扫码不该丢掉今日「已上报」（见 accountSwitched）
+		h.invalidateAccountCaches()
+	}
+	jsonWrite(w, http.StatusOK, map[string]any{
+		"status": "success",
+		"account": map[string]any{
+			"uid": tok.UID, "nickname": tok.Nickname, "domain": tok.Domain,
+			"expires_human": tok.ExpiresInHuman(),
+		},
+	})
+}
+
+func (h *Handler) accountRefresh(w http.ResponseWriter, r *http.Request) {
+	if err := h.client.RefreshNow(); err != nil {
+		jsonErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	t := h.toks.Get()
+	jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "expires_human": t.ExpiresInHuman(), "expires_at": t.ExpiresAt})
+}
+
+func (h *Handler) accountTest(w http.ResponseWriter, r *http.Request) {
+	if err := h.client.Ping(); err != nil {
+		jsonWrite(w, http.StatusOK, map[string]any{"ok": false, "message": err.Error()})
+		return
+	}
+	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (h *Handler) accountDelete(w http.ResponseWriter, r *http.Request) {
+	if err := h.toks.Clear(); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.invalidateAccountCaches()
+	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountExport 导出当前账号凭证为 token.json（下载附件）。
+func (h *Handler) accountExport(w http.ResponseWriter, r *http.Request) {
+	t := h.toks.Get()
+	if t == nil {
+		jsonErr(w, http.StatusBadRequest, "尚未登录，无凭证可导出")
+		return
+	}
+	data, err := json.MarshalIndent(t, "", "  ")
+	if err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="token.json"`)
+	w.Write(data)
+}
+
+// accountImport 导入账号凭证，必须含 access_token（合法 JWT），其余可选。
+func (h *Handler) accountImport(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		TokenType    string `json:"token_type"`
+		ExpiresAt    int64  `json:"expires_at"`
+		Domain       string `json:"domain"`
+		Nickname     string `json:"nickname"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	req.AccessToken = strings.TrimSpace(req.AccessToken)
+	if req.AccessToken == "" {
+		jsonErr(w, http.StatusBadRequest, "access_token 不能为空")
+		return
+	}
+	if _, _, _, _, _, err := auth.ParseJWT(req.AccessToken); err != nil {
+		jsonErr(w, http.StatusBadRequest, "access_token 不是合法 JWT: "+err.Error())
+		return
+	}
+	t := &auth.Token{
+		AccessToken:  req.AccessToken,
+		RefreshToken: strings.TrimSpace(req.RefreshToken),
+		TokenType:    strings.TrimSpace(req.TokenType),
+		ExpiresAt:    req.ExpiresAt,
+		Domain:       strings.TrimSpace(req.Domain),
+		Nickname:     strings.TrimSpace(req.Nickname),
+	}
+	t.EnrichFromJWT()
+	if t.TokenType == "" {
+		t.TokenType = "Bearer"
+	}
+	if t.Domain == "" {
+		t.Domain = config.EndpointOf(h.cfg.Get().Region).Domain
+	}
+	prev := h.toks.Get()
+	if err := h.toks.Save(t); err != nil {
+		jsonErr(w, http.StatusInternalServerError, "保存凭证失败: "+err.Error())
+		return
+	}
+	if accountSwitched(prev, t) {
+		// 同账号重导不清，否则今日上报会按新会话再发一轮（见 accountSwitched）
+		h.invalidateAccountCaches()
+	}
+	jsonWrite(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"uid":      t.UID,
+		"nickname": t.Nickname,
+		"domain":   t.Domain,
+	})
+}
+
+// ── 余额 ──
+
+// resourceAccount 额度包明细。
+//
+// CapacityRemain/Size/Used 为「有效展示值」：当存在周期数据时优先取周期级
+// （CycleCapacity*），否则回退账户级（Capacity*）。CodeBuddy 免费/裂变包按月
+// 周期计费，账户级 CapacityUsed 恒为 0，真实已用落在周期级；直接取账户级会让
+// 前端「已用」恒显 0、进度条恒满。与 references/wicm84266964 effective_remain 一致。
+// CycleRemain/Used/Size 始终为周期级原始值（无周期数据则为 0），供前端细分展示。
+type resourceAccount struct {
+	PackageName    string  `json:"package_name"`
+	ProductName    string  `json:"product_name"`
+	CapacityRemain float64 `json:"capacity_remain"` // 有效剩余（周期优先）
+	CapacitySize   float64 `json:"capacity_size"`   // 有效总量（周期优先）
+	CapacityUsed   float64 `json:"capacity_used"`   // 有效已用（周期优先）
+	CycleRemain    float64 `json:"cycle_remain"`    // 本周期剩余
+	CycleUsed      float64 `json:"cycle_used"`      // 本周期已用
+	CycleSize      float64 `json:"cycle_size"`      // 本周期总量
+	CapacityUnit   string  `json:"capacity_unit"`
+	PackageType    string  `json:"package_type"`
+	ResourceType   any     `json:"resource_type"`
+	AutoRenewFlag  any     `json:"auto_renew_flag"`
+	Status         any     `json:"status"`
+	ExpireTime     string  `json:"expire_time"`
+	DaysLeft       *int    `json:"days_left"` // nil = 未知
+	Expired        bool    `json:"expired"`
+	Warn           string  `json:"warn"` // "7d" | "30d" | ""
+
+	// Key 稳定标识，供前端 x-for 的 :key 使用。上游无可靠 id 字段，同名同类额度包可并存，
+	// 故以内容指纹为键（内容相同的包渲染等价，允许重复）。不可用数组下标：
+	// 前端「隐藏已用完」过滤数组后，Alpine 会按下标复用 DOM 节点，导致卡片内容错位。
+	Key string `json:"key"`
+}
+
+// resourceAccountKey 由额度包展示字段计算稳定指纹，用作前端 x-for 的 :key。
+// 取 sha256 摘要前 8 字节：包名可含任意字符，指纹与额度包在数组中的顺序无关。
+func resourceAccountKey(a resourceAccount) string {
+	h := sha256.New()
+	// 用长度前缀而非分隔符：上游字段可含任意字节（含 \x00），
+	// 分隔符拼接会使 ("a\x00b","c") 与 ("a","b\x00c") 碰撞。
+	writeField := func(s string) {
+		var n [8]byte
+		binary.BigEndian.PutUint64(n[:], uint64(len(s)))
+		h.Write(n[:])
+		h.Write([]byte(s))
+	}
+	writeNum := func(f float64) {
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], math.Float64bits(f))
+		h.Write(b[:])
+	}
+	writeField(a.PackageName)
+	writeField(a.ProductName)
+	writeNum(a.CapacityRemain)
+	writeNum(a.CapacitySize)
+	writeNum(a.CapacityUsed)
+	writeField(a.ExpireTime)
+	if a.Expired {
+		h.Write([]byte{1})
+	} else {
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil)[:8])
+}
+
+// resourceCacheKey 余额缓存键版本：缓存内容为加工后结构，新增或修改字段必须提升版本，
+// 否则会命中旧行、向前端返回缺字段的数据。历史变更：v1→v2 total_dosage 改为本地聚合
+// （旧口径按账户级 Remain 统计）；v2→v3 每个额度包新增稳定标识 key（前端 x-for 的 :key）。
+const resourceCacheKey = "default_v3"
+
+// resourceCacheStaleKeys 升级时一并清理的旧缓存键；缓存表无清理任务，不删除则永久残留（删除操作幂等）。
+var resourceCacheStaleKeys = []string{"default", "default_v2"}
+
+func (h *Handler) resources(w http.ResponseWriter, r *http.Request) {
+	cfg := h.cfg.Get()
+	force := r.URL.Query().Get("force") == "1"
+	table, key := "resource_cache", resourceCacheKey
+
+	if !force {
+		if payload, updatedAt, ok := h.st.GetCache(table, key, cfg.ResourceCacheSeconds); ok {
+			var parsed any
+			_ = json.Unmarshal([]byte(payload), &parsed)
+			jsonWrite(w, http.StatusOK, map[string]any{"cached": true, "updated_at": updatedAt, "data": parsed})
+			return
+		}
+	}
+	res, err := h.client.Resources()
+	if err != nil {
+		jsonErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	processed := processResources(res.Raw)
+	// 缓存与返回同为加工后结构，保证命中缓存时前端形状一致
+	if raw, err := json.Marshal(processed); err == nil {
+		_ = h.st.SetCache(table, key, string(raw))
+	}
+	for _, stale := range resourceCacheStaleKeys {
+		_ = h.st.DeleteCacheKey(table, stale)
+	}
+	jsonWrite(w, http.StatusOK, map[string]any{"cached": false, "updated_at": time.Now().Unix(), "data": processed})
+}
+
+// processResources 解包 data.Response.Data 并本地加工。
+func processResources(raw json.RawMessage) map[string]any {
+	var top map[string]any
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return map[string]any{"raw": json.RawMessage(raw)}
+	}
+	node := top
+	for _, k := range []string{"data", "Response", "Data"} {
+		if next, ok := node[k].(map[string]any); ok {
+			node = next
+		}
+	}
+	out := map[string]any{
+		"upstream_total_dosage": number(node["TotalDosage"]), // 官方原始值（账户级聚合，含周期外幻影），仅供对照
+		"total_count":           number(node["TotalCount"]),
+		"raw":                   top,
+	}
+	now := time.Now()
+	var accounts []resourceAccount
+	if rawAccounts, ok := node["Accounts"].([]any); ok {
+		for _, ra := range rawAccounts {
+			acc, ok := ra.(map[string]any)
+			if !ok {
+				continue
+			}
+			a := resourceAccount{
+				PackageName:   strOr(acc, "PackageName", "ProductName"),
+				ProductName:   str(acc, "ProductName"),
+				CapacityUnit:  toStr(acc["CapacityUnit"]),
+				PackageType:   toStr(acc["PackageType"]),
+				ResourceType:  acc["ResourceType"],
+				AutoRenewFlag: acc["AutoRenewFlag"],
+				Status:        acc["Status"],
+			}
+			// 账户级与周期级分别取值（Precise → 非Precise 回退）。
+			acctRemain := numField(acc, "CapacityRemainPrecise", "CapacityRemain")
+			acctSize := numField(acc, "CapacitySizePrecise", "CapacitySize")
+			acctUsed := numField(acc, "CapacityUsedPrecise", "CapacityUsed")
+			cycRemain := numField(acc, "CycleCapacityRemainPrecise", "CycleCapacityRemain")
+			cycUsed := numField(acc, "CycleCapacityUsedPrecise", "CycleCapacityUsed")
+			cycSize := numField(acc, "CycleCapacitySizePrecise", "CycleCapacitySize")
+			if cycSize == 0 {
+				cycSize = acctSize // 周期总量缺失回退账户总量（与参考契约一致）
+			}
+			// 有效展示值：存在周期数据（剩余或已用 > 0）时优先用周期级，否则用账户级。
+			// CodeBuddy 免费/裂变包按月计费，账户级 CapacityUsed 恒为 0，真实已用
+			// 落在 CycleCapacityUsed；不做周期优先会让「已用」恒显 0、进度条恒满。
+			a.CycleRemain, a.CycleUsed, a.CycleSize = cycRemain, cycUsed, cycSize
+			if cycRemain > 0 || cycUsed > 0 {
+				a.CapacityRemain, a.CapacitySize, a.CapacityUsed = cycRemain, cycSize, cycUsed
+			} else {
+				a.CapacityRemain, a.CapacitySize, a.CapacityUsed = acctRemain, acctSize, acctUsed
+			}
+			// 到期时间按上游契约回退：ExpiredTime → DeductionEndTime → CycleEndTime。
+			// 实测免费/裂变包 ExpiredTime 常为空，真正到期落在 Deduction/Cycle 字段。
+			disp, et, ok := resolveExpireTime(acc)
+			a.ExpireTime = disp
+			if ok {
+				days := int(et.Sub(now).Hours() / 24)
+				a.DaysLeft = &days
+				a.Expired = et.Before(now)
+				switch {
+				case a.Expired:
+					a.Warn = "expired"
+				case days <= 7:
+					a.Warn = "7d"
+				case days <= 30:
+					a.Warn = "30d"
+				}
+			}
+			accounts = append(accounts, a)
+		}
+	}
+	// 内容指纹（见 resourceAccount.Key）须在全部字段赋值完成后计算，故单独遍历一轮。
+	for i := range accounts {
+		accounts[i].Key = resourceAccountKey(accounts[i])
+	}
+	// 可用额度 total_dosage = Σ 未过期包的有效剩余（capacity_remain，周期优先口径），
+	// 与包卡片「剩余」合计一致；到期未知（days_left == nil）的包视为有效，纳入累计。
+	// 不透传上游 TotalDosage：该字段按账户级 CapacityRemain 聚合，而按月周期计费的
+	// 包（体验版/裂变包）周期额度用尽后账户级 Remain 不随周期扣减，周期外幻影剩余
+	// 会被一直计入（实测体验版恒多算 500，真实可用为 0 时总额度仍显示 500）。
+	// 官方原始值保留在 upstream_total_dosage 供前端对照展示。
+	available := 0.0
+	for _, a := range accounts {
+		if !a.Expired {
+			available += a.CapacityRemain
+		}
+	}
+	out["total_dosage"] = math.Round(available*100) / 100
+
+	// 按到期时间升序（未知的排最后）
+	sort.Slice(accounts, func(i, j int) bool {
+		pi, pj := accounts[i].DaysLeft, accounts[j].DaysLeft
+		switch {
+		case pi == nil && pj == nil:
+			return false
+		case pi == nil:
+			return false // i 未知 → 排后
+		case pj == nil:
+			return true // j 未知 → i 排前
+		default:
+			return *pi < *pj
+		}
+	})
+	out["accounts"] = accounts
+	return out
+}
+
+// ── 签到 ──
+
+func (h *Handler) checkinStatus(w http.ResponseWriter, r *http.Request) {
+	// 附带今日随机签到时刻（random 模式下由调度器生成并缓存，重启不重摇）
+	randomTarget := ""
+	if payload, _, ok := h.st.GetCache("checkin_cache", "random_target", 48*3600); ok {
+		if t, err := time.Parse(time.RFC3339, payload); err == nil && t.Format("2006-01-02") == time.Now().Format("2006-01-02") {
+			randomTarget = t.Format("15:04")
+		}
+	}
+	// 优先读缓存（60s），避免高频查询
+	if payload, updatedAt, ok := h.st.GetCache("checkin_cache", "status", 60); ok {
+		var parsed any
+		_ = json.Unmarshal([]byte(payload), &parsed)
+		jsonWrite(w, http.StatusOK, map[string]any{"cached": true, "updated_at": updatedAt, "random_target": randomTarget, "data": parsed})
+		return
+	}
+	res, err := h.client.CheckinStatus()
+	if err != nil {
+		jsonErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	_ = h.st.SetCache("checkin_cache", "status", string(res.Raw))
+	var parsed any
+	_ = json.Unmarshal(res.Raw, &parsed)
+	jsonWrite(w, http.StatusOK, map[string]any{"cached": false, "updated_at": time.Now().Unix(), "random_target": randomTarget, "data": parsed})
+}
+
+func (h *Handler) checkinClaim(w http.ResponseWriter, r *http.Request) {
+	res, err := h.client.ClaimCheckin()
+	if err != nil {
+		jsonErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	var parsed any
+	_ = json.Unmarshal(res.Raw, &parsed)
+	jsonWrite(w, http.StatusOK, map[string]any{"ok": true, "data": parsed})
+}
+
+// ── keys ──
+
+func (h *Handler) listKeys(w http.ResponseWriter, r *http.Request) {
+	keys, err := h.keys.List()
+	if err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	jsonWrite(w, http.StatusOK, map[string]any{"keys": keys})
+}
+
+func (h *Handler) createKey(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name      string `json:"name"`
+		CustomKey string `json:"custom_key"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	k, err := h.keys.Create(req.Name, req.CustomKey)
+	if err != nil {
+		jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	jsonWrite(w, http.StatusOK, map[string]any{"key": k})
+}
+
+func (h *Handler) updateKey(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id <= 0 {
+		jsonErr(w, http.StatusBadRequest, "id 非法")
+		return
+	}
+	var req struct {
+		Name   *string `json:"name"`
+		Status *string `json:"status"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	if err := h.keys.Update(id, req.Name, req.Status); err != nil {
+		jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	k, _ := h.st.GetKey(id)
+	jsonWrite(w, http.StatusOK, map[string]any{"key": k})
+}
+
+func (h *Handler) deleteKey(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id <= 0 {
+		jsonErr(w, http.StatusBadRequest, "id 非法")
+		return
+	}
+	if err := h.keys.Delete(id); err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	jsonWrite(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// ── 日志 / 统计 ──
+
+func (h *Handler) logs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	f := store.LogFilter{
+		Model:    strings.TrimSpace(q.Get("model")),
+		Status:   0,
+		Page:     atoiDefault(q.Get("page"), 1),
+		PageSize: atoiDefault(q.Get("page_size"), 20),
+	}
+	if v := q.Get("key_id"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			f.KeyID = n
+		}
+	}
+	switch q.Get("status") {
+	case "error":
+		f.Status = -1
+	case "":
+	default:
+		if n, err := strconv.Atoi(q.Get("status")); err == nil {
+			f.Status = n
+		}
+	}
+	items, total, err := h.st.QueryLogs(f)
+	if err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	jsonWrite(w, http.StatusOK, map[string]any{"logs": items, "total": total, "page": f.Page, "page_size": f.PageSize})
+}
+
+func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
+	st, err := h.st.GetStats()
+	if err != nil {
+		jsonErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	jsonWrite(w, http.StatusOK, st)
+}
+
+// ── 设置 ──
+
+func (h *Handler) getSettings(w http.ResponseWriter, r *http.Request) {
+	cfg := h.cfg.Get()
+	jsonWrite(w, http.StatusOK, map[string]any{
+		"listen":                 cfg.Listen,
+		"region":                 cfg.Region,
+		"auto_checkin":           cfg.AutoCheckin,
+		"checkin_cron":           cfg.CheckinCron,
+		"checkin_mode":           cfg.CheckinMode,
+		"checkin_random_start":   cfg.CheckinRandomStart,
+		"checkin_random_end":     cfg.CheckinRandomEnd,
+		"checkin_fallback":       cfg.CheckinFallback,
+		"auto_growth":            cfg.AutoGrowth,
+		"growth_report_cron":     cfg.GrowthReportCron,
+		"growth_travel_cron":     cfg.GrowthTravelCron,
+		"growth_report_count":    cfg.GrowthReportCount,
+		"growth_report_jitter":   cfg.GrowthReportJitter,
+		"resource_cache_seconds": cfg.ResourceCacheSeconds,
+		"log_retention_days":     cfg.LogRetentionDays,
+		"log_max_size_mb":        cfg.LogMaxSizeMB,
+		"chat_timeout_seconds":   cfg.ChatTimeoutSeconds,
+	})
+}
+
+func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		OldPassword          *string `json:"old_password"`
+		NewPassword          *string `json:"new_password"`
+		Listen               *string `json:"listen"`
+		Region               *string `json:"region"`
+		AutoCheckin          *bool   `json:"auto_checkin"`
+		CheckinCron          *string `json:"checkin_cron"`
+		CheckinMode          *string `json:"checkin_mode"`
+		CheckinRandomStart   *string `json:"checkin_random_start"`
+		CheckinRandomEnd     *string `json:"checkin_random_end"`
+		CheckinFallback      *bool   `json:"checkin_fallback"`
+		AutoGrowth           *bool   `json:"auto_growth"`
+		GrowthReportCron     *string `json:"growth_report_cron"`
+		GrowthTravelCron     *string `json:"growth_travel_cron"`
+		GrowthReportCount    *int    `json:"growth_report_count"`
+		GrowthReportJitter   *int    `json:"growth_report_jitter"`
+		ResourceCacheSeconds *int    `json:"resource_cache_seconds"`
+		LogRetentionDays     *int    `json:"log_retention_days"`
+		LogMaxSizeMB         *int    `json:"log_max_size_mb"`
+		ChatTimeoutSeconds   *int    `json:"chat_timeout_seconds"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	oldCfg := h.cfg.Get()
+	regionChanged := false
+
+	// 改密码（独立处理：需验证旧密码）
+	if req.NewPassword != nil {
+		if old := deref(req.OldPassword); old == "" || !h.cfg.VerifyAdminPassword(old) {
+			jsonErr(w, http.StatusBadRequest, "旧密码错误")
+			return
+		}
+		if len(*req.NewPassword) < 6 {
+			jsonErr(w, http.StatusBadRequest, "新密码至少 6 位")
+			return
+		}
+		if err := h.cfg.SetAdminPasswordHash(hashPassword(*req.NewPassword)); err != nil {
+			jsonErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
+	// 监听地址格式校验（保存后需用户自行重启生效）
+	if req.Listen != nil {
+		if err := config.ValidateListen(*req.Listen); err != nil {
+			jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	err := h.cfg.Update(func(c *config.Config) error {
+		if req.Listen != nil {
+			c.Listen = strings.TrimSpace(*req.Listen)
+		}
+		if req.Region != nil {
+			if *req.Region != "cn" && *req.Region != "global" {
+				return fmt.Errorf("region 仅支持 cn/global")
+			}
+			if *req.Region != c.Region {
+				regionChanged = true
+				c.Region = *req.Region
+			}
+		}
+		if req.AutoCheckin != nil {
+			c.AutoCheckin = *req.AutoCheckin
+		}
+		if req.CheckinCron != nil {
+			if !validCron(*req.CheckinCron) {
+				return fmt.Errorf("cron 表达式非法（需 6 段含秒，如 0 0 9 * * *）")
+			}
+			c.CheckinCron = *req.CheckinCron
+		}
+		if req.CheckinMode != nil {
+			if m := strings.TrimSpace(*req.CheckinMode); m != "fixed" && m != "random" {
+				return fmt.Errorf("签到方式仅支持 fixed/random")
+			} else {
+				c.CheckinMode = m
+			}
+		}
+		if req.CheckinRandomStart != nil || req.CheckinRandomEnd != nil {
+			start, end := c.CheckinRandomStart, c.CheckinRandomEnd
+			if req.CheckinRandomStart != nil {
+				start = strings.TrimSpace(*req.CheckinRandomStart)
+			}
+			if req.CheckinRandomEnd != nil {
+				end = strings.TrimSpace(*req.CheckinRandomEnd)
+			}
+			if err := config.ValidateCheckinWindow(start, end); err != nil {
+				return err
+			}
+			c.CheckinRandomStart, c.CheckinRandomEnd = start, end
+		}
+		if req.CheckinFallback != nil {
+			c.CheckinFallback = *req.CheckinFallback
+		}
+		if req.AutoGrowth != nil {
+			c.AutoGrowth = *req.AutoGrowth
+		}
+		if req.GrowthReportCron != nil {
+			if !validCron(*req.GrowthReportCron) {
+				return fmt.Errorf("上报链 cron 表达式非法（需 6 段含秒，如 0 0 10 * * *）")
+			}
+			c.GrowthReportCron = strings.TrimSpace(*req.GrowthReportCron)
+		}
+		if req.GrowthTravelCron != nil {
+			if !validCron(*req.GrowthTravelCron) {
+				return fmt.Errorf("旅行巡检 cron 表达式非法（需 6 段含秒，如 0 0 9,21 * * *）")
+			}
+			c.GrowthTravelCron = strings.TrimSpace(*req.GrowthTravelCron)
+		}
+		if req.GrowthReportCount != nil {
+			n := *req.GrowthReportCount
+			if n < 1 {
+				n = 1
+			}
+			if n > config.GrowthReportCountMax {
+				n = config.GrowthReportCountMax // 钳制防风控，不报错（与 Normalize 口径一致）
+			}
+			c.GrowthReportCount = n
+		}
+		if req.GrowthReportJitter != nil {
+			n := *req.GrowthReportJitter
+			if n < 0 {
+				n = 0
+			}
+			if n > config.GrowthReportJitterMax {
+				n = config.GrowthReportJitterMax
+			}
+			c.GrowthReportJitter = n
+		}
+		if req.ResourceCacheSeconds != nil && *req.ResourceCacheSeconds > 0 {
+			c.ResourceCacheSeconds = *req.ResourceCacheSeconds
+		}
+		if req.LogRetentionDays != nil && *req.LogRetentionDays > 0 {
+			c.LogRetentionDays = *req.LogRetentionDays
+		}
+		if req.LogMaxSizeMB != nil && *req.LogMaxSizeMB > 0 {
+			c.LogMaxSizeMB = *req.LogMaxSizeMB
+		}
+		// 写入 Transport 的构建参数，保存后需重启生效（同 listen）
+		if req.ChatTimeoutSeconds != nil {
+			if err := config.ValidateChatTimeoutSeconds(*req.ChatTimeoutSeconds); err != nil {
+				return err
+			}
+			c.ChatTimeoutSeconds = *req.ChatTimeoutSeconds
+		}
+		// 存量 cron 兜底：请求未携带该字段时（前端在功能关闭时不下发），
+		// 校验存量值；非法（常见来源是 env 写错位数）则回落默认，
+		// 避免一条用户看不见/改不了的非法 cron 永久阻断无关设置保存。
+		if req.CheckinCron == nil && !validCron(c.CheckinCron) {
+			slog.Warn("存量 checkin_cron 非法，回落默认", "value", c.CheckinCron)
+			c.CheckinCron = config.DefaultCheckinCron
+		}
+		if req.GrowthReportCron == nil && !validCron(c.GrowthReportCron) {
+			slog.Warn("存量 growth_report_cron 非法，回落默认", "value", c.GrowthReportCron)
+			c.GrowthReportCron = config.DefaultGrowthReportCron
+		}
+		if req.GrowthTravelCron == nil && !validCron(c.GrowthTravelCron) {
+			slog.Warn("存量 growth_travel_cron 非法，回落默认", "value", c.GrowthTravelCron)
+			c.GrowthTravelCron = config.DefaultGrowthTravelCron
+		}
+		return nil
+	})
+	if err != nil {
+		jsonErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// region 切换 → 立即重新拉取模型列表
+	if regionChanged {
+		if err := h.models.Refresh(h.client); err != nil {
+			// 失败已回退内置表，不阻断设置保存
+			_ = err
+		}
+	}
+	// 签到开关/cron 变化 → 重装配定时任务
+	if h.sched != nil {
+		h.sched.Reconfigure()
+	}
+	_ = oldCfg
+
+	h.getSettings(w, r)
+}
+
+// ── 模型 ──
+
+func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
+	jsonWrite(w, http.StatusOK, map[string]any{
+		"ids":    h.models.List(),
+		"models": h.models.View(), // 含当前生效倍率（基础倍率 + 折扣活动计算）
+		"state":  h.models.State(),
+	})
+}
+
+func (h *Handler) refreshModels(w http.ResponseWriter, r *http.Request) {
+	if err := h.models.Refresh(h.client); err != nil {
+		jsonErr(w, http.StatusBadGateway, "刷新失败（已回退/保留旧表）: "+err.Error())
+		return
+	}
+	jsonWrite(w, http.StatusOK, map[string]any{"ids": h.models.List(), "state": h.models.State()})
+}
+
+// ── util ──
+
+func atoiDefault(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	if n, err := strconv.Atoi(s); err == nil && n > 0 {
+		return n
+	}
+	return def
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func str(m map[string]any, k string) string {
+	v, _ := m[k].(string)
+	return v
+}
+
+func toStr(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+func strOr(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func number(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case string:
+		var f float64
+		_, _ = fmt.Sscanf(n, "%g", &f)
+		return f
+	}
+	return 0
+}
+
+// numField 按优先级依次尝试 keys，返回首个“有值”字段的解析结果，与参考实现
+// _to_float(precise, _to_float(nonPrecise)) 语义一致：nil / 空串 / 解析失败视为无值
+// 并回退到下一个 key；"0" 是合法零值，不触发回退。用于额度包的 capacity 数值字段，
+// 上游对免费/裂变包常只返回非 Precise 字段或 Precise 为空串，缺少回退会导致
+// “已用/剩余/总量”恒为 0。
+func numField(acc map[string]any, keys ...string) float64 {
+	for _, k := range keys {
+		switch n := acc[k].(type) {
+		case nil:
+			continue
+		case string:
+			if strings.TrimSpace(n) == "" {
+				continue
+			}
+			var f float64
+			if _, err := fmt.Sscanf(n, "%g", &f); err == nil {
+				return f
+			}
+		case float64:
+			return n
+		}
+	}
+	return 0
+}
+
+// resolveExpireTime 按上游契约回退选取到期时间：ExpiredTime → DeductionEndTime → CycleEndTime。
+// 实测 CodeBuddy 免费/裂变包 ExpiredTime 常为空字符串，真正到期信息落在 DeductionEndTime
+// （毫秒时间戳）或 CycleEndTime（日期串）。返回 (展示串, 时间, 是否有效)；空值/0/9999-99-99
+// 哨兵跳过，数字时间戳格式化为本地可读串，字符串原样返回。
+func resolveExpireTime(acc map[string]any) (string, time.Time, bool) {
+	for _, key := range []string{"ExpiredTime", "DeductionEndTime", "CycleEndTime"} {
+		raw := acc[key]
+		switch v := raw.(type) {
+		case string:
+			if v == "" || strings.HasPrefix(v, "9999-99-99") {
+				continue
+			}
+		case float64:
+			if v == 0 {
+				continue
+			}
+		}
+		if et, ok := parseFlexibleTime(raw); ok && !et.IsZero() {
+			if s, ok := raw.(string); ok {
+				return s, et, true
+			}
+			return et.Local().Format("2006-01-02 15:04:05"), et, true
+		}
+	}
+	return "", time.Time{}, false
+}
+
+// billingTZ 上游 billing 日期串（"2006-01-02 15:04:05" 等无时区格式）为腾讯云
+// 北京时间（UTC+8，无夏令时，实测周期边界如 CycleStartTime "2026-08-01 00:00:00"
+// 印证），与部署时区无关。若用 time.Local 解析，非 +8 时区部署（Docker TZ 覆盖）的
+// 到期判定会偏差最多 8 小时；Expired 现在直接决定包是否计入可用额度聚合。
+// 用 FixedZone 而非 LoadLocation，避免运行环境缺 tzdata 时解析失败。
+var billingTZ = time.FixedZone("UTC+8", 8*60*60)
+
+// parseFlexibleTime 宽容解析时间：数字（秒/毫秒）、RFC3339、常见格式。
+// 无时区格式的日期串按 billingTZ（北京时间）解析；RFC3339 自带偏移不受影响。
+func parseFlexibleTime(v any) (time.Time, bool) {
+	switch t := v.(type) {
+	case float64:
+		sec := int64(t)
+		if sec > 1e12 { // 毫秒
+			return time.Unix(sec/1e3, 0), true
+		}
+		return time.Unix(sec, 0), true
+	case string:
+		if t == "" {
+			return time.Time{}, false
+		}
+		layouts := []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05", "2006-01-02"}
+		for _, layout := range layouts {
+			if ts, err := time.ParseInLocation(layout, t, billingTZ); err == nil {
+				return ts, true
+			}
+		}
+	}
+	return time.Time{}, false
+}

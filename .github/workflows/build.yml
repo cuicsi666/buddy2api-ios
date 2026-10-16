@@ -1,0 +1,82 @@
+name: build-ios
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["V*"]
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      APP_NAME: "Buddy网关"
+      VERSION_TAG: ${{ github.ref_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+          cache-dependency-path: go/go.sum
+
+      - name: Build Go core as iOS static library (c-archive)
+        working-directory: go
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CC=$(xcrun --sdk iphoneos -f clang)
+          export GOOS=ios GOARCH=arm64 CGO_ENABLED=1
+          export CC
+          export CGO_CFLAGS="-isysroot $SDK -miphoneos-version-min=15.0 -arch arm64 -fembed-bitcode=off"
+          export CGO_LDFLAGS="-isysroot $SDK -miphoneos-version-min=15.0 -arch arm64"
+          go build -tags carchive -buildmode=c-archive \
+            -ldflags "-s -w -X buddy2api-go/internal/proxy.Version=v1.0-ios" \
+            -o ../ios/GoLib/libbuddy.a ./iosmain
+          ls -la ../ios/GoLib/
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Build .app
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Buddy2API.xcodeproj \
+            -scheme Buddy2API \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            build | tail -60
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          ls -la "$APP"
+
+      - name: Package IPA (unsigned)
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          cd build/Build/Products/Release-iphoneos
+          mkdir -p Payload
+          cp -R *.app Payload/
+          zip -qry "$APP_NAME.ipa" Payload
+          ls -la
+          cp "$APP_NAME.ipa" "$GITHUB_WORKSPACE/$APP_NAME.ipa"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Buddy网关-ipa
+          path: "*.ipa"
+          if-no-files-found: error
