@@ -92,7 +92,8 @@ final class Gateway: ObservableObject {
     /// 开关后台保活（静音音频播放，防系统挂起）
     func applyKeepAlive(_ wanted: Bool) {
         if wanted && running {
-            keepAliveOn = KeepAlive.shared.start()
+            let strong = (UserDefaults.standard.object(forKey: "keepAliveStrong") as? Bool) ?? false
+            keepAliveOn = KeepAlive.shared.start(strong: strong)
         } else {
             KeepAlive.shared.stop()
             keepAliveOn = false

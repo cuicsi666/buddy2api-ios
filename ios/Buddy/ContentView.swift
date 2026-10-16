@@ -5,6 +5,7 @@ struct ContentView: View {
     @State private var showPanel = false
     @AppStorage("autoStart") private var autoStart = true
     @AppStorage("keepAlive") private var keepAlive = true
+    @AppStorage("keepAliveStrong") private var keepAliveStrong = false
 
     private var alertBinding: Binding<Bool> {
         Binding(get: { gw.alert != nil }, set: { if !$0 { gw.alert = nil } })
@@ -88,6 +89,13 @@ struct ContentView: View {
                 .onChange(of: keepAlive) { on in
                     gw.applyKeepAlive(on)
                 }
+
+            if keepAlive {
+                Toggle("保活强力模式（锁屏显示为播放中）", isOn: $keepAliveStrong)
+                    .onChange(of: keepAliveStrong) { _ in
+                        gw.applyKeepAlive(keepAlive)
+                    }
+            }
         }
     }
 
